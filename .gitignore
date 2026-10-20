@@ -42,9 +42,16 @@ env/
 *.db
 *.sqlite
 *.sqlite3
+*.state.json
+*.state.json.tmp
+*.state.json.lock
 
 # Logs
 *.log
+monitor_metrics.jsonl
+slot_events.json
+slot_events.json.tmp
+.pytest_tmp/
 
 # OS
 .DS_Store
