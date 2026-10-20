@@ -34,7 +34,7 @@ SERVICE_NAME = (
 )
 DEFAULT_SCHEDULE = "mon@06:30;tue@07:30;wed@06:30;thu@07:30;fri@06:30"
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4}
-DELIVERY_WINDOW = timedelta(minutes=2)
+RELEASE_DELIVERY_WINDOW = timedelta(minutes=10)
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +47,7 @@ class Settings:
     until: date | None
     state_file: Path
     log_file: Path
+    second_lead_minutes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -54,9 +55,12 @@ class Reminder:
     at: datetime
     kind: str
     release_at: datetime
+    lead_minutes: int = 0
 
     @property
     def key(self) -> str:
+        if self.kind == "before" and self.lead_minutes != 10:
+            return f"{self.release_at.date().isoformat()}:before_{self.lead_minutes}"
         return f"{self.release_at.date().isoformat()}:{self.kind}"
 
 
@@ -88,6 +92,11 @@ def load_settings() -> Settings:
     lead = int(os.getenv("NOTFALL_REMINDER_LEAD_MINUTES", "10"))
     if not 1 <= lead <= 60:
         raise ValueError("NOTFALL_REMINDER_LEAD_MINUTES must be between 1 and 60")
+    second_lead = int(os.getenv("NOTFALL_REMINDER_SECOND_LEAD_MINUTES", "2"))
+    if not 1 <= second_lead < lead:
+        raise ValueError(
+            "NOTFALL_REMINDER_SECOND_LEAD_MINUTES must be positive and earlier than the first reminder"
+        )
     cutoff = os.getenv("NOTFALL_REMINDER_UNTIL", "").strip()
     return Settings(
         token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -105,6 +114,7 @@ def load_settings() -> Settings:
         log_file=Path(
             os.getenv("NOTFALL_REMINDER_LOG_FILE", "monitor/notfall/reminder.log")
         ),
+        second_lead_minutes=second_lead,
     )
 
 
@@ -118,25 +128,38 @@ def reminders_from(start: date, settings: Settings, days: int = 14) -> list[Remi
         if release_time is None:
             continue
         release_at = datetime.combine(day, release_time, tzinfo=BERLIN)
-        reminders.extend(
-            (
+        leads = [settings.lead_minutes]
+        if settings.second_lead_minutes is not None:
+            leads.append(settings.second_lead_minutes)
+        for lead in leads:
+            reminders.append(
                 Reminder(
-                    release_at - timedelta(minutes=settings.lead_minutes),
+                    release_at - timedelta(minutes=lead),
                     "before",
                     release_at,
-                ),
-                Reminder(release_at, "release", release_at),
+                    lead,
+                )
             )
-        )
+        reminders.append(Reminder(release_at, "release", release_at))
     return sorted(reminders, key=lambda item: item.at)
+
+
+def delivery_deadline(reminder: Reminder) -> datetime:
+    if reminder.kind == "before":
+        return reminder.release_at
+    return reminder.release_at + RELEASE_DELIVERY_WINDOW
 
 
 def reminder_message(reminder: Reminder, lead_minutes: int) -> str:
     release = reminder.release_at.strftime("%d.%m.%Y %H:%M")
     if reminder.kind == "before":
-        opening = f"KVR | Notfall randevu hatırlatması\n{lead_minutes} dakika sonra: {release} (Berlin)."
+        opening = (
+            "KVR | Notfall randevu hatırlatması\n"
+            f"{reminder.lead_minutes or lead_minutes} dakika öncesi uyarısı; "
+            f"açılış {release} (Berlin)."
+        )
     else:
-        opening = f"KVR | Notfall randevu saati\nŞimdi: {release} (Berlin)."
+        opening = f"KVR | Notfall randevu saati\nResmî açılış: {release} (Berlin)."
     return (
         f"{opening}\n"
         f"Hizmet: {SERVICE_NAME}\n"
@@ -219,33 +242,43 @@ async def run(settings: Settings) -> None:
         while True:
             now = datetime.now(BERLIN)
             events = reminders_from(now.date(), settings)
-            pending = [
+            eligible = [
                 item
                 for item in events
-                if item.at <= now < item.at + DELIVERY_WINDOW and item.key not in sent
+                if item.at <= now < delivery_deadline(item)
+                and item.key not in sent
+                and not any(
+                    later.release_at == item.release_at
+                    and later.at > item.at
+                    and later.key in sent
+                    for later in events
+                )
             ]
-            for item in pending:
+            if eligible:
+                # After an outage, send only the newest still useful reminder.
+                item = max(eligible, key=lambda entry: entry.at)
                 message = reminder_message(item, settings.lead_minutes)
                 try:
                     await asyncio.to_thread(send_telegram, settings, message)
                 except RuntimeError as exc:
                     logger.error("%s", exc)
                     await asyncio.sleep(20)
-                    break
-                sent[item.key] = datetime.now(BERLIN).isoformat()
-                write_sent(settings.state_file, sent)
-                logger.info(
-                    "Telegram gönderildi | %s | %s",
-                    item.kind,
-                    item.release_at.strftime("%d.%m.%Y %H:%M"),
-                )
-            else:
-                future = next((item for item in events if item.at > now), None)
-                if future is None:
-                    logger.info("Notfall hatırlatma bitiş tarihi geçti; program kapanıyor.")
-                    return
-                delay = min(60.0, max(0.5, (future.at - datetime.now(BERLIN)).total_seconds()))
-                await asyncio.sleep(delay)
+                    continue
+                else:
+                    sent[item.key] = datetime.now(BERLIN).isoformat()
+                    write_sent(settings.state_file, sent)
+                    logger.info(
+                        "Telegram gönderildi | %s | %s",
+                        item.key,
+                        item.release_at.strftime("%d.%m.%Y %H:%M"),
+                    )
+                    continue
+            future = next((item for item in events if item.at > now), None)
+            if future is None:
+                logger.info("Notfall hatırlatma bitiş tarihi geçti; program kapanıyor.")
+                return
+            delay = min(60.0, max(0.5, (future.at - datetime.now(BERLIN)).total_seconds()))
+            await asyncio.sleep(delay)
     finally:
         lock.unlink(missing_ok=True)
 
@@ -254,13 +287,17 @@ def print_status(settings: Settings) -> None:
     now = datetime.now(BERLIN)
     sent = read_sent(settings.state_file)
     events = reminders_from(now.date(), settings)
-    upcoming = [item for item in events if item.at >= now][:4]
+    upcoming = [item for item in events if item.at >= now][:6]
     print("KVR öğrenci/mezun Notfall hatırlatıcısı | Europe/Berlin")
     print("Durum dosyası:", settings.state_file)
     print("Günlük:", settings.log_file)
     print("Bugün gönderilen:", sum(key.startswith(now.date().isoformat()) for key in sent))
     for item in upcoming:
-        label = "Ön hatırlatma" if item.kind == "before" else "Açılış hatırlatması"
+        label = (
+            f"{item.lead_minutes} dk önce"
+            if item.kind == "before"
+            else "Açılış hatırlatması"
+        )
         print(f"{label}: {item.at:%d.%m.%Y %H:%M}")
     if not upcoming:
         print("Planlı yeni hatırlatma yok.")

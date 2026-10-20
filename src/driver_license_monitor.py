@@ -1275,7 +1275,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def main(args: argparse.Namespace | None = None) -> None:
+def _monitor_error_exit_code(exc: Exception) -> int:
+    """2: temporary connection failure; 3: access control; 1: other failure."""
+    detail = str(exc).lower()
+    if any(marker in detail for marker in ("http 403", "http 429", "captcha", "access check")):
+        return 3
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)) or any(
+        marker in detail
+        for marker in (
+            "net::err_",
+            "telegram api",
+            "target closed",
+            "connection closed",
+            "timeout",
+            "timed out",
+        )
+    ):
+        return 2
+    return 1
+
+
+async def main(args: argparse.Namespace | None = None) -> int | None:
     args = args or parse_args()
     settings = load_settings(
         validate_booking=not (
@@ -1415,25 +1435,29 @@ async def main(args: argparse.Namespace | None = None) -> None:
                             first_scan = False
                         outcome = "match_visible" if result.selected else "no_match"
                     except Exception as exc:  # noqa: BLE001
+                        exit_code = _monitor_error_exit_code(exc)
                         safe_error = (
                             str(exc)
                             if isinstance(exc, RuntimeError)
                             else type(exc).__name__
                         )
-                        logger.error("İzleme durdu | neden: %s", safe_error)
-                        outcome = "stopped_error"
-                        try:
-                            await notify(
-                                settings,
-                                f"KVR | İzleme durdu\nNeden: {safe_error}",
-                                metrics,
-                            )
-                        except Exception as notification_error:  # noqa: BLE001
-                            logger.error(
-                                "Hata bildirimi Telegram'a gönderilemedi (%s).",
-                                type(notification_error).__name__,
-                            )
-                        return
+                        outcome = "temporary_error" if exit_code == 2 else "stopped_error"
+                        if exit_code == 2:
+                            logger.error("Geçici bağlantı hatası | neden: %s", safe_error)
+                        else:
+                            logger.error("İzleme durdu | neden: %s", safe_error)
+                            try:
+                                await notify(
+                                    settings,
+                                    f"KVR | İzleme durdu\nNeden: {safe_error}",
+                                    metrics,
+                                )
+                            except Exception as notification_error:  # noqa: BLE001
+                                logger.error(
+                                    "Hata bildirimi Telegram'a gönderilemedi (%s).",
+                                    type(notification_error).__name__,
+                                )
+                        return exit_code
                     finally:
                         elapsed = round(clock.perf_counter() - started_perf, 3)
                         delay, interval = next_check_delay(
@@ -1504,6 +1528,6 @@ if __name__ == "__main__":
         configuration = load_settings(validate_booking=False)
         configure_logging(configuration.log_file)
         try:
-            asyncio.run(main(options))
+            raise SystemExit(asyncio.run(main(options)) or 0)
         except KeyboardInterrupt:
             print("İzleme kullanıcı tarafından durduruldu.")
