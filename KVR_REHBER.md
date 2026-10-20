@@ -17,7 +17,7 @@ Bu saatler, randevu ekranındaki **“Wann gibt es neue Termine?”** açıklama
 | Benim tarih tercihim | **30 Ekim 2026'ya kadar:** herhangi bir saat. **2–20 Kasım:** erken sabah veya geç saat. **Son sınır: 24 Kasım 2026.** Bunlar KVR kuralı değil, benim tercihlerim. |
 | Benim gözlemim | **3 Kasım 2026** için birden çok öğleden sonra saati gördüm; sonra boş saat kalmadı. Başka bir taramada yalnız **15:40** göründü. Görünen kontenjan hızla değişiyor. |
 | Rezervasyon akışı | Uygun gün/saat → iletişim bilgileri → özet ekranında **elektronik haberleşme onayı** → “Termin reservieren”. Gelen e-postadaki bağlantıyı **ben** etkinleştiririm. |
-| Botun şu anki durumu | Ehliyet botu uygun saatleri izliyor ve bildiriyor. `.env` içindeki `AUTO_BOOK_ENABLED=false` olduğu sürece rezervasyon göndermiyor. |
+| Botun ayarı | Bu bilgisayarın gizli `.env` dosyasında `AUTO_BOOK_ENABLED=true`. Program başlatıldığında tercihlere uyan ilk saat için **tek rezervasyon isteği** gönderebilir; e-posta bağlantısını ben onaylarım. Bu ayar programı kendiliğinden başlatmaz. |
 
 | Yerel komutlar — proje klasöründe PowerShell | Komut |
 | --- | --- |
@@ -31,7 +31,7 @@ Bu saatler, randevu ekranındaki **“Wann gibt es neue Termine?”** açıklama
 
 Tek komut, iki ayrı görev açar. Aynı terminalde satırların başında **[Ehliyet]** veya **[Notfall]** görünür; kayıt ve koşulları ayrı kalır. `--start-at 06:15` bugünkü saat geçtiyse **yarın** 06:15 anlamına gelir. Tam tarih geçmişteyse komut hata verir. `--plan` görevleri başlatmaz. **Ctrl+C** ikisini de durdurur. Başlatıcı `monitor/runner.log`, ehliyet `monitor/monitor.log`, Notfall `monitor/notfall/reminder.log` dosyasına yazar. Başlatıcı açıkken Windows'un boşta uyumasını engeller; kapağı kapatmak, bilgisayarı elle uyutmak veya yeniden başlatmak programı keser.
 
-İnternet kesilirse ehliyet izleyicisi geçici bağlantı hatasında **1, 2, 4, 8 ve en fazla 15 dakika** aralıklarla yeniden denenir. Böyle bir kesinti Notfall hatırlatıcısını durdurmaz. CAPTCHA, erişim engeli veya başka kalıcı hata halinde ehliyet görevi durur ve nedenini gösterir; site koruması aşılmaz. `AUTO_BOOK_ENABLED=false` kaldığı sürece uygun saati bildirse bile rezervasyon göndermez.
+İnternet kesilirse ehliyet izleyicisi geçici bağlantı hatasında **1, 2, 4, 8 ve en fazla 15 dakika** aralıklarla yeniden denenir. Böyle bir kesinti Notfall hatırlatıcısını durdurmaz. CAPTCHA, erişim engeli veya başka kalıcı hata halinde ehliyet görevi durur ve nedenini gösterir; site koruması aşılmaz. Rezervasyonu yalnızca izlemek istersem yerel `.env` içindeki `AUTO_BOOK_ENABLED=false` yaparım.
 
 # Blue Card: öğrenci/mezun Notfall randevusu
 
