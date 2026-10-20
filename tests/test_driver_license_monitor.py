@@ -8,17 +8,21 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.driver_license_monitor import (
+    ScanResult,
     Settings,
     _write_state,
     acquire_instance_lock,
     append_metrics,
     booking_is_pending,
     choose_slot,
+    format_availability_alert,
+    matching_alerts,
     monitor_status,
     next_check_delay,
     parse_schedule,
     parse_slots,
     parse_windows,
+    record_alert_delivery,
     record_slot_events,
 )
 
@@ -186,6 +190,81 @@ def test_booking_guard_and_instance_lock_prevent_duplicate_attempts(tmp_path):
         lock.unlink()
 
 
+def test_alerts_group_matches_and_throttle_the_same_slot_across_restarts(tmp_path):
+    path = tmp_path / "slots.json"
+    windows = parse_windows("2026-11-02..2026-11-20@16:00-23:59")
+    first = datetime(2026, 10, 20, 14, tzinfo=ZoneInfo("Europe/Berlin"))
+    a = (date(2026, 11, 3), time(16, 20))
+    b = (date(2026, 11, 3), time(16, 40))
+    changes = record_slot_events(path, [a, b], windows, first)
+    result = ScanResult(None, changes.first_seen, changes.reappeared, (a, b), 2)
+    alerts = matching_alerts(
+        path, result, first_scan=True, observed_at=first, cooldown_minutes=30
+    )
+    assert len(alerts) == 2
+    message = format_availability_alert(alerts, first)
+    assert message.count("KVR | Tercihine uygun termin bulundu") == 1
+    assert "03.11.2026 16:20" in message
+    assert "03.11.2026 16:40" in message
+    assert "Rezervasyon yapılmadı" in message
+    record_alert_delivery(path, alerts, first)
+
+    five_minutes = first.replace(minute=5)
+    assert (
+        matching_alerts(
+            path,
+            result,
+            first_scan=True,
+            observed_at=five_minutes,
+            cooldown_minutes=30,
+        )
+        == ()
+    )
+    record_slot_events(path, [], windows, five_minutes)
+    changes = record_slot_events(path, [a], windows, five_minutes)
+    returned = ScanResult(None, changes.first_seen, changes.reappeared, (a,), 1)
+    assert returned.reappeared == (a,)
+    assert (
+        matching_alerts(
+            path,
+            returned,
+            first_scan=False,
+            observed_at=five_minutes,
+            cooldown_minutes=30,
+        )
+        == ()
+    )
+    after_cooldown = first.replace(minute=35)
+    continuous = ScanResult(None, (), (), (a,), 1)
+    assert (
+        matching_alerts(
+            path,
+            continuous,
+            first_scan=True,
+            observed_at=after_cooldown,
+            cooldown_minutes=30,
+        )
+        == ()
+    )
+    record_slot_events(path, [], windows, after_cooldown)
+    changes = record_slot_events(path, [a], windows, after_cooldown)
+    returned = ScanResult(None, changes.first_seen, changes.reappeared, (a,), 1)
+    alerts = matching_alerts(
+        path,
+        returned,
+        first_scan=False,
+        observed_at=after_cooldown,
+        cooldown_minutes=30,
+    )
+    assert len(alerts) == 1
+    assert alerts[0].reason == "yeniden açıldı"
+    record_alert_delivery(path, alerts, after_cooldown)
+    import json
+
+    events = json.loads(path.read_text(encoding="utf-8"))
+    assert events["2026-11-03 16:20"]["alert_count"] == 2
+
+
 def test_local_status_reports_booking_and_last_scan_without_contact_data(tmp_path):
     settings = Settings(
         windows=parse_windows("2026-11-02..2026-11-20@16:00-23:59#latest"),
@@ -221,7 +300,7 @@ def test_local_status_reports_booking_and_last_scan_without_contact_data(tmp_pat
     )
     status = monitor_status(settings)
     assert "03.11.2026 16:40" in status
-    assert "Last scan: 2026-10-20T15:59:00+02:00; 2 visible" in status
-    assert "email activation" in status
+    assert "Son tarama: 20.10.2026 15:59:00 (Berlin) | görünen: 2" in status
+    assert "e-posta aktivasyonunu" in status
     assert "private@example.com" not in status
     assert "secret-token" not in status

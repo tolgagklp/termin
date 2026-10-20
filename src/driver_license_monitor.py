@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time as clock
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -18,7 +19,8 @@ from datetime import UTC, date, datetime, time, timedelta
 from itertools import pairwise
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -122,6 +124,7 @@ class Settings:
     events_file: Path
     metrics_file: Path
     log_file: Path
+    alert_cooldown_minutes: int = 30
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,7 @@ class ScanResult:
     selected: AppointmentSlot | None
     arrivals: tuple[tuple[date, time], ...]
     reappeared: tuple[tuple[date, time], ...]
+    matching_slots: tuple[tuple[date, time], ...]
     visible_count: int
 
 
@@ -144,6 +148,13 @@ class ScanResult:
 class SlotChanges:
     first_seen: tuple[tuple[date, time], ...]
     reappeared: tuple[tuple[date, time], ...]
+
+
+@dataclass(frozen=True)
+class AlertItem:
+    appointment_date: date
+    appointment_time: time
+    reason: str
 
 
 def parse_windows(value: str) -> tuple[PreferenceWindow, ...]:
@@ -316,6 +327,12 @@ def load_settings(*, validate_booking: bool = True) -> Settings:
     if token == "your_bot_token_here":
         token = ""
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    try:
+        alert_cooldown_minutes = int(os.getenv("ALERT_COOLDOWN_MINUTES", "30"))
+    except ValueError as exc:
+        raise ValueError("ALERT_COOLDOWN_MINUTES must be a whole number") from exc
+    if not 0 <= alert_cooldown_minutes <= 1440:
+        raise ValueError("ALERT_COOLDOWN_MINUTES must be between 0 and 1440")
     if (
         validate_booking
         and auto_book
@@ -344,6 +361,7 @@ def load_settings(*, validate_booking: bool = True) -> Settings:
         events_file=Path(os.getenv("SLOT_EVENTS_FILE", "monitor/slot_events.json")),
         metrics_file=Path(os.getenv("MONITOR_METRICS_FILE", "monitor/metrics.jsonl")),
         log_file=Path(os.getenv("MONITOR_LOG_FILE", "monitor/monitor.log")),
+        alert_cooldown_minutes=alert_cooldown_minutes,
     )
 
 
@@ -470,9 +488,7 @@ async def read_available_slots(
                     "The official page presented a CAPTCHA or access check; monitoring stopped."
                 )
         if month is None:
-            logger.info(
-                "Official page says no appointments are available; waiting for the next scheduled check."
-            )
+            logger.info("Resmî sayfada şu anda termin yok; sonraki kontrol beklenecek.")
             metrics["active_days"] = 0.0
             metrics["slot_reading"] = 0.0
             return []
@@ -518,9 +534,9 @@ async def _scan_calendar(page, month, windows, metrics, check_access):
                 if match:
                     enabled_days.append(int(match.group()))
         logger.info(
-            "Calendar %s active days: %s",
+            "Takvim %s | aktif günler: %s",
             month.strftime("%Y-%m"),
-            enabled_days or "none",
+            enabled_days or "yok",
         )
 
         with timed(metrics, "slot_reading"):
@@ -545,10 +561,10 @@ async def _scan_calendar(page, month, windows, metrics, check_access):
                     f"{GERMAN_WEEKDAYS[slot_date.weekday()]}, {slot_date:%d.%m.%Y}\n{group_text}"
                 )
                 logger.info(
-                    "Date %s visible times: %s",
+                    "Gün %s | görünen saatler: %s",
                     slot_date,
                     ", ".join(f"{slot_time:%H:%M}" for _, slot_time in day_slots)
-                    or "none",
+                    or "yok",
                 )
                 slots.extend(day_slots)
 
@@ -640,7 +656,7 @@ def _read_state(path: Path) -> dict:
         return {}
     except (json.JSONDecodeError, OSError):
         logger.error(
-            "Could not read monitor state; refusing to risk a duplicate booking"
+            "Rezervasyon durumu okunamadı; ikinci bir rezervasyon denenmeyecek."
         )
         return {"booking_pending": True}
 
@@ -719,6 +735,77 @@ def record_slot_events(
     return SlotChanges(tuple(arrivals), tuple(reappeared))
 
 
+def matching_alerts(
+    path: Path,
+    result: ScanResult,
+    *,
+    first_scan: bool,
+    observed_at: datetime,
+    cooldown_minutes: int,
+) -> tuple[AlertItem, ...]:
+    """Choose one alert per slot within the cooldown, including process restarts."""
+    events = json.loads(path.read_text(encoding="utf-8"))
+    arrivals = set(result.arrivals)
+    reappeared = set(result.reappeared)
+    candidates = (
+        result.matching_slots
+        if first_scan
+        else tuple(sorted((arrivals | reappeared) & set(result.matching_slots)))
+    )
+    alerts = []
+    for slot_date, slot_time in candidates:
+        event = events[f"{slot_date:%Y-%m-%d} {slot_time:%H:%M}"]
+        last_alerted = event.get("last_alerted_at")
+        if (
+            first_scan
+            and last_alerted
+            and (slot_date, slot_time) not in arrivals | reappeared
+        ):
+            continue
+        if last_alerted and (
+            observed_at.astimezone(UTC)
+            - datetime.fromisoformat(last_alerted).astimezone(UTC)
+        ) < timedelta(minutes=cooldown_minutes):
+            continue
+        reason = (
+            "yeniden açıldı"
+            if (slot_date, slot_time) in reappeared
+            else "yeni"
+            if (slot_date, slot_time) in arrivals
+            else "izleme başlarken açıktı"
+        )
+        alerts.append(AlertItem(slot_date, slot_time, reason))
+    return tuple(alerts)
+
+
+def record_alert_delivery(
+    path: Path, alerts: tuple[AlertItem, ...], delivered_at: datetime
+) -> None:
+    events = json.loads(path.read_text(encoding="utf-8"))
+    for alert in alerts:
+        key = f"{alert.appointment_date:%Y-%m-%d} {alert.appointment_time:%H:%M}"
+        events[key]["last_alerted_at"] = delivered_at.isoformat()
+        events[key]["alert_count"] = int(events[key].get("alert_count", 0)) + 1
+    _write_state(path, events)
+
+
+def format_availability_alert(
+    alerts: tuple[AlertItem, ...], observed_at: datetime
+) -> str:
+    lines = [
+        "KVR | Tercihine uygun termin bulundu",
+        "Hizmet: Umschreibung eines ausländischen Führerscheins",
+        "Saatler:",
+        *(
+            f"• {item.appointment_date:%d.%m.%Y} {item.appointment_time:%H:%M} — {item.reason}"
+            for item in alerts
+        ),
+        f"Kontrol: {observed_at:%d.%m.%Y %H:%M} (Berlin)",
+        "İzleme modu: Rezervasyon yapılmadı.",
+    ]
+    return "\n".join(lines)
+
+
 def append_metrics(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as output:
@@ -787,26 +874,36 @@ def observation_report(events_file: Path, metrics_file: Path) -> str:
         else 0
     )
     lines = [
-        f"Scan attempts/completed: {len(scans)}/{len(complete)}; distinct appointment times first seen: {len(events)}",
-        f"Recorded reappearances: {sum(max(0, int(value.get('appearance_count', 1)) - 1) for value in events.values())}",
-        f"Observation span: {span:.1f} hours",
-        f"First seen 07:00-08:30: {morning}; 13:40-14:45: {afternoon}; other times: {len(first_seen) - morning - afternoon}",
-        "First sightings by Berlin hour: "
+        f"Tarama denemesi / tamamlanan: {len(scans)} / {len(complete)}",
+        f"Farklı termin saatleri: {len(events)} | yeniden görülme: {sum(max(0, int(value.get('appearance_count', 1)) - 1) for value in events.values())}",
+        f"Gözlem süresi: {span:.1f} saat",
+        f"İlk görülme 07:00-08:30: {morning} | 13:40-14:45: {afternoon} | diğer: {len(first_seen) - morning - afternoon}",
+        "İlk görülmeler (Berlin saati): "
         + (
             ", ".join(
                 f"{hour:02d}:00={count}" for hour, count in by_hour.items() if count
             )
-            or "none"
+            or "yok"
         ),
-        f"Scan duration mean/max: {sum(durations) / len(durations):.2f}s / {max(durations):.2f}s"
+        f"Tarama süresi ortalama / en uzun: {sum(durations) / len(durations):.2f} / {max(durations):.2f} sn"
         if durations
-        else "Scan duration: no data",
-        f"Actual start gap mean/min: {sum(gaps) / len(gaps):.1f}s / {min(gaps):.1f}s"
+        else "Tarama süresi: veri yok",
+        f"Başlangıç aralığı ortalama / en kısa: {sum(gaps) / len(gaps):.1f} / {min(gaps):.1f} sn"
         if gaps
-        else "Actual start gap: no repeated monitor cycles yet",
-        f"Schedule overruns: {sum(float(scan.get('overrun_seconds', 0)) > 0 for scan in scans)}",
+        else "Başlangıç aralığı: art arda izleme verisi henüz yok",
+        f"Planlanan aralığı aşan taramalar: {sum(float(scan.get('overrun_seconds', 0)) > 0 for scan in scans)}",
     ]
     stage_names = sorted({name for scan in complete for name in scan.get("stages", {})})
+    stage_labels = {
+        "active_days": "Aktif günleri okuma",
+        "calendar_load": "Takvimi yükleme",
+        "first_weiter": "İlk Weiter",
+        "page_open": "Sayfayı açma",
+        "preference_algorithm": "Tercih seçimi",
+        "service_selection": "Hizmeti seçme",
+        "slot_reading": "Saatleri okuma",
+        "telegram_notification": "Telegram bildirimi",
+    }
     for name in stage_names:
         values = [
             float(scan["stages"][name])
@@ -814,11 +911,11 @@ def observation_report(events_file: Path, metrics_file: Path) -> str:
             if name in scan.get("stages", {})
         ]
         lines.append(
-            f"  {name}: mean {sum(values) / len(values):.3f}s, max {max(values):.3f}s"
+            f"  {stage_labels.get(name, name)}: ortalama {sum(values) / len(values):.3f} sn, en uzun {max(values):.3f} sn"
         )
     if span < 24:
         lines.append(
-            "Fewer than 24 hours of scans; release-time conclusions are premature."
+            "24 saatten az gözlem var; terminlerin yayımlanma saatine dair sonuç çıkarmak için erken."
         )
     return "\n".join(lines)
 
@@ -826,42 +923,56 @@ def observation_report(events_file: Path, metrics_file: Path) -> str:
 def monitor_status(settings: Settings) -> str:
     state = _read_state(settings.state_file)
     if state.get("booking_submitted"):
-        booking = "Reservation request submitted; email activation is checked manually."
+        booking = (
+            "Rezervasyon isteği gönderildi; e-posta aktivasyonunu sen doğrulamalısın."
+        )
     elif state.get("booking_pending"):
-        booking = "Reservation outcome pending or unclear; review email/site before restarting auto booking."
+        booking = "Rezervasyon sonucu beklemede veya belirsiz; yeniden başlatmadan önce e-postanı ve resmî sayfayı kontrol et."
     else:
-        booking = "No reservation request recorded by this monitor."
+        booking = "Bu izleyicinin kaydettiği rezervasyon isteği yok."
     lines = [
-        f"Automatic booking: {'enabled' if settings.auto_book else 'disabled'}",
+        f"Otomatik rezervasyon: {'açık' if settings.auto_book else 'kapalı'}",
         booking,
     ]
     if state.get("slot"):
-        lines.append(f"Recorded appointment: {state['slot']}")
+        lines.append(f"Kayıtlı termin: {state['slot']}")
     if state.get("pending_started_at"):
-        lines.append(f"Reservation attempt started at: {state['pending_started_at']}")
+        when = datetime.fromisoformat(state["pending_started_at"]).astimezone(BERLIN)
+        lines.append(f"Rezervasyon denemesi: {when:%d.%m.%Y %H:%M} (Berlin)")
     if state.get("submitted_at"):
-        lines.append(f"Request submitted at: {state['submitted_at']}")
+        when = datetime.fromisoformat(state["submitted_at"]).astimezone(BERLIN)
+        lines.append(f"İstek gönderildi: {when:%d.%m.%Y %H:%M} (Berlin)")
     if state.get("activation_deadline_at"):
         deadline = datetime.fromisoformat(state["activation_deadline_at"])
         seconds_left = (deadline.astimezone(UTC) - datetime.now(UTC)).total_seconds()
         time_left = (
-            f"about {int((seconds_left + 59) // 60)} minutes remaining"
+            f"yaklaşık {int((seconds_left + 59) // 60)} dakika kaldı"
             if seconds_left > 0
-            else "estimated deadline passed"
+            else "tahmini süre doldu"
         )
         lines.append(
-            f"Estimated email activation deadline: {deadline.isoformat()} ({time_left})"
+            f"Tahmini e-posta aktivasyon sonu: {deadline.astimezone(BERLIN):%d.%m.%Y %H:%M} (Berlin; {time_left})"
         )
     try:
         last = settings.metrics_file.read_text(encoding="utf-8").splitlines()[-1]
         scan = json.loads(last)
+        result_labels = {
+            "completed": "tamamlandı",
+            "no_match": "uygun termin yok",
+            "match_visible": "uygun termin görüldü",
+            "booking_attempted": "rezervasyon denendi",
+            "stopped_error": "hata nedeniyle durdu",
+            "error": "hata",
+        }
+        outcome = scan.get("outcome", "bilinmiyor")
+        started = datetime.fromisoformat(scan["started_at"]).astimezone(BERLIN)
         lines.append(
-            f"Last scan: {scan.get('started_at', 'unknown')}; "
-            f"{scan.get('visible_slots', '?')} visible; "
-            f"outcome {scan.get('outcome', 'unknown')}"
+            f"Son tarama: {started:%d.%m.%Y %H:%M:%S} (Berlin) | "
+            f"görünen: {scan.get('visible_slots', '?')} | "
+            f"sonuç: {result_labels.get(outcome, outcome)}"
         )
     except (FileNotFoundError, IndexError, json.JSONDecodeError):
-        lines.append("Last scan: none recorded")
+        lines.append("Son tarama: kayıt yok")
     return "\n".join(lines)
 
 
@@ -870,13 +981,31 @@ async def notify(
 ) -> None:
     metrics = metrics if metrics is not None else {}
     if not settings.telegram_token or not settings.telegram_chat_id:
-        logger.info("Telegram is not configured; notification was not sent")
+        logger.info("Telegram ayarlı değil; bildirim gönderilmedi.")
         return
-    from telegram import Bot
-
     with timed(metrics, "telegram_notification"):
-        async with Bot(settings.telegram_token) as bot:
-            await bot.send_message(chat_id=settings.telegram_chat_id, text=message)
+        await asyncio.to_thread(
+            _telegram_api,
+            settings.telegram_token,
+            "sendMessage",
+            {"chat_id": settings.telegram_chat_id, "text": message},
+        )
+
+
+def _telegram_api(token: str, method: str, fields: dict | None = None) -> dict:
+    """Use Telegram's HTTPS API; keep the token out of errors and logs."""
+    data = urlencode(fields).encode("utf-8") if fields else None
+    request = Request(f"https://api.telegram.org/bot{token}/{method}", data=data)
+    try:
+        with urlopen(request, timeout=20) as response:
+            result = json.load(response)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Telegram API {method} başarısız ({type(exc).__name__})."
+        ) from None
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API {method} isteği reddedildi.")
+    return result
 
 
 def acquire_instance_lock(path: Path) -> Path:
@@ -941,9 +1070,10 @@ async def submit_booking(
             matching_buttons.append(button)
     if len(matching_buttons) != 1:
         return (
-            f"Contact details are filled and the appointment is at the overview ({slot.label}), "
-            "but the final booking button was ambiguous, so no reservation was submitted. "
-            "Review the official site manually before restarting the monitor."
+            "KVR | Rezervasyon gönderilmedi\n"
+            f"Termin: {slot.label}\n"
+            "Son rezervasyon düğmesi net bulunamadı. Resmî sayfayı kontrol et; "
+            "otomatik olarak tekrar denenmeyecek."
         )
 
     with timed(metrics, "consent_checkbox"):
@@ -961,13 +1091,14 @@ async def submit_booking(
             ).wait_for(timeout=20_000)
     except Exception as exc:  # noqa: BLE001
         logger.error(
-            "Final booking action was clicked but confirmation was unclear (%s)",
+            "Son rezervasyon düğmesine basıldı; sonuç net değil (%s).",
             type(exc).__name__,
         )
         return (
-            f"The final booking action was clicked for {slot.label}, but the site did not show "
-            f"a clear confirmation. Check {settings.email} and the browser result; the monitor "
-            "will not retry automatically."
+            "KVR | Rezervasyon sonucu belirsiz\n"
+            f"Termin: {slot.label}\n"
+            "Son düğmeye basıldı fakat açık bir onay görünmedi. E-postanı ve resmî "
+            "sayfayı kontrol et. Otomatik olarak tekrar denenmeyecek."
         )
     submitted_at = datetime.now(BERLIN)
     _write_state(
@@ -985,8 +1116,10 @@ async def submit_booking(
         },
     )
     return (
-        f"Appointment request submitted for {slot.label}. Check {settings.email} and "
-        "manually activate the confirmation link within 60 minutes."
+        "KVR | Rezervasyon isteği gönderildi\n"
+        f"Termin: {slot.label}\n"
+        "E-postandaki bağlantıyı 60 dakika içinde açıp elle onayla. "
+        "İzleme durdu; ikinci rezervasyon denenmeyecek."
     )
 
 
@@ -1001,27 +1134,35 @@ async def check_page(
     metrics = metrics if metrics is not None else {}
     slots = await read_available_slots(page, settings.windows, metrics)
     logger.info(
-        "Visible appointment slots: %s",
-        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in slots) or "none",
+        "Görünen terminler: %s",
+        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in slots) or "yok",
     )
     observed_at = datetime.now(BERLIN)
     changes = record_slot_events(
         settings.events_file, slots, settings.windows, observed_at
     )
+    matching = tuple(
+        slot
+        for slot in slots
+        if slot[0] >= observed_at.date()
+        and any(window.contains(*slot) for window in settings.windows)
+    )
     logger.info(
-        "First seen slots: %s; reappeared slots: %s",
-        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in changes.first_seen) or "none",
-        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in changes.reappeared) or "none",
+        "İlk görülenler: %s | yeniden görülenler: %s",
+        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in changes.first_seen) or "yok",
+        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in changes.reappeared) or "yok",
     )
     with timed(metrics, "preference_algorithm"):
         selected = choose_slot(slots, settings.windows, today=observed_at.date())
     if selected is None:
-        logger.info("No slot matches the configured date and time preferences.")
-        return ScanResult(None, changes.first_seen, changes.reappeared, len(slots))
+        logger.info("Tarih ve saat tercihlerine uyan termin yok.")
+        return ScanResult(
+            None, changes.first_seen, changes.reappeared, matching, len(slots)
+        )
 
     window = settings.windows[selected.preference_rank]
     logger.info(
-        "Selected %s: preference %d (%s..%s, %s-%s, %s time on earliest day)",
+        "Tercihe göre seçilen: %s | sıra %d (%s..%s, %s-%s, %s)",
         selected.label,
         selected.preference_rank + 1,
         window.start_date,
@@ -1031,15 +1172,20 @@ async def check_page(
         window.order,
     )
     if not auto_book:
-        return ScanResult(selected, changes.first_seen, changes.reappeared, len(slots))
+        return ScanResult(
+            selected, changes.first_seen, changes.reappeared, matching, len(slots)
+        )
 
     if booking_is_pending(settings.state_file):
         raise RuntimeError(
             "A previous booking is already pending; refusing to prepare another one."
         )
     message = await submit_booking(page, settings, selected, metrics)
+    logger.warning("%s", message)
     await notify(settings, message, metrics)
-    return ScanResult(selected, changes.first_seen, changes.reappeared, len(slots))
+    return ScanResult(
+        selected, changes.first_seen, changes.reappeared, matching, len(slots)
+    )
 
 
 async def run_once(
@@ -1084,7 +1230,13 @@ async def run_once(
                         "stages": metrics,
                     },
                 )
-                logger.info("Scan completed in %.3fs; stages=%s", duration, metrics)
+                logger.info(
+                    "Tek tarama tamamlandı | süre: %.2f sn | görünen: %d | yeni: %d | yeniden görülen: %d",
+                    duration,
+                    visible_count,
+                    arrival_count,
+                    reappeared_count,
+                )
         finally:
             await browser.close()
 
@@ -1144,25 +1296,24 @@ async def main(args: argparse.Namespace | None = None) -> None:
     if args.telegram_chat_id:
         if not settings.telegram_token:
             raise SystemExit("Set TELEGRAM_BOT_TOKEN before reading chat IDs.")
-        from telegram import Bot
-
         try:
-            async with Bot(settings.telegram_token) as bot:
-                updates = await bot.get_updates(limit=20, timeout=0)
+            payload = await asyncio.to_thread(
+                _telegram_api, settings.telegram_token, "getUpdates"
+            )
         except Exception as exc:  # noqa: BLE001
             raise SystemExit(
                 f"Could not read bot messages ({type(exc).__name__}); check the token and bot setup."
             ) from None
         chat_ids = sorted(
             {
-                update.effective_chat.id
-                for update in updates
-                if update.effective_chat is not None
+                item["message"]["chat"]["id"]
+                for item in payload.get("result", [])[-20:]
+                if "message" in item
             }
         )
         print(
-            "Chat IDs from recent bot messages: "
-            + (", ".join(map(str, chat_ids)) or "none; send /start to your bot first")
+            "Botun son mesajlarındaki sohbet kimlikleri: "
+            + (", ".join(map(str, chat_ids)) or "yok; önce bota /start gönder")
         )
         return
     if args.test_telegram:
@@ -1170,10 +1321,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
             raise SystemExit(
                 "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID before testing Telegram."
             )
-        await notify(
-            settings, "KVR termin monitor test: Telegram notifications are working."
-        )
-        print("Telegram test message sent.")
+        await notify(settings, "KVR | Test bildirimi\nTelegram bildirimleri çalışıyor.")
+        print("Telegram test bildirimi gönderildi.")
         return
     if args.once:
         await run_once(settings, auto_book=False)
@@ -1184,7 +1333,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             raise SystemExit("Disable AUTO_BOOK_ENABLED before using --local-only.")
         settings = replace(settings, telegram_token="", telegram_chat_id="")
         logger.warning(
-            "Local-only monitoring: matching slots appear in terminal and monitor.log; Telegram alerts are disabled."
+            "Yerel izleme başladı | uygun saatler terminale ve monitor.log dosyasına yazılacak; Telegram kapalı."
         )
     elif not settings.telegram_token or not settings.telegram_chat_id:
         raise SystemExit(
@@ -1218,15 +1367,21 @@ async def main(args: argparse.Namespace | None = None) -> None:
                     visible_count = 0
                     arrival_count = 0
                     reappeared_count = 0
+                    alerted_count = 0
                     try:
                         if settings.auto_book and booking_is_pending(
                             settings.state_file
                         ):
+                            message = (
+                                "KVR | İzleme durdu\nÖnceden kaydedilmiş bir rezervasyon "
+                                "isteği var veya sonucu belirsiz. İkinci rezervasyon denenmeyecek."
+                            )
                             await notify(
                                 settings,
-                                "A booking is already pending. Monitoring has stopped to prevent duplicates.",
+                                message,
                                 metrics,
                             )
+                            logger.warning("%s", message)
                             return
                         result = await check_page(
                             page,
@@ -1241,32 +1396,22 @@ async def main(args: argparse.Namespace | None = None) -> None:
                             outcome = "booking_attempted"
                             return
                         if not settings.auto_book:
-                            arrivals = [
-                                slot
-                                for slot in (*result.arrivals, *result.reappeared)
-                                if slot[0] >= started_at.date()
-                                and any(
-                                    window.contains(*slot)
-                                    for window in settings.windows
-                                )
-                            ]
-                            if first_scan and result.selected:
-                                message = f"Matching appointment found: {result.selected.label}"
-                                if args.local_only:
-                                    logger.warning("LOCAL ALERT: %s", message)
-                                else:
+                            alerts = matching_alerts(
+                                settings.events_file,
+                                result,
+                                first_scan=first_scan,
+                                observed_at=started_at,
+                                cooldown_minutes=settings.alert_cooldown_minutes,
+                            )
+                            if alerts:
+                                message = format_availability_alert(alerts, started_at)
+                                if not args.local_only:
                                     await notify(settings, message, metrics)
-                            elif arrivals:
-                                labels = ", ".join(
-                                    f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in arrivals
+                                logger.warning("%s", message)
+                                record_alert_delivery(
+                                    settings.events_file, alerts, datetime.now(BERLIN)
                                 )
-                                message = (
-                                    f"Newly visible matching appointments: {labels}"
-                                )
-                                if args.local_only:
-                                    logger.warning("LOCAL ALERT: %s", message)
-                                else:
-                                    await notify(settings, message, metrics)
+                                alerted_count = len(alerts)
                             first_scan = False
                         outcome = "match_visible" if result.selected else "no_match"
                     except Exception as exc:  # noqa: BLE001
@@ -1275,13 +1420,19 @@ async def main(args: argparse.Namespace | None = None) -> None:
                             if isinstance(exc, RuntimeError)
                             else type(exc).__name__
                         )
-                        logger.error("Appointment check stopped: %s", safe_error)
+                        logger.error("İzleme durdu | neden: %s", safe_error)
                         outcome = "stopped_error"
-                        await notify(
-                            settings,
-                            f"Appointment monitor stopped: {safe_error}",
-                            metrics,
-                        )
+                        try:
+                            await notify(
+                                settings,
+                                f"KVR | İzleme durdu\nNeden: {safe_error}",
+                                metrics,
+                            )
+                        except Exception as notification_error:  # noqa: BLE001
+                            logger.error(
+                                "Hata bildirimi Telegram'a gönderilemedi (%s).",
+                                type(notification_error).__name__,
+                            )
                         return
                     finally:
                         elapsed = round(clock.perf_counter() - started_perf, 3)
@@ -1298,6 +1449,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
                                 "visible_slots": visible_count,
                                 "new_slots": arrival_count,
                                 "reappeared_slots": reappeared_count,
+                                "alerted_slots": alerted_count,
                                 "actual_start_gap_seconds": actual_start_gap,
                                 "target_interval_seconds": interval,
                                 "next_start_after_seconds": delay,
@@ -1306,13 +1458,18 @@ async def main(args: argparse.Namespace | None = None) -> None:
                             },
                         )
                         logger.info(
-                            "Scan %.3fs; prior start gap %s; schedule %ds; next start after %ds; overrun %.3fs; stages=%s",
+                            "Tarama tamamlandı | süre: %.2f sn | görünen: %d | yeni: %d | geri dönen: %d | bildirilen: %d | sonraki kontrol: ~%s (Berlin)",
                             elapsed,
-                            actual_start_gap,
-                            interval,
-                            delay,
-                            max(0, elapsed - delay),
-                            metrics,
+                            visible_count,
+                            arrival_count,
+                            reappeared_count,
+                            alerted_count,
+                            (
+                                datetime.now(UTC)
+                                + timedelta(seconds=max(0, delay - elapsed))
+                            )
+                            .astimezone(BERLIN)
+                            .strftime("%H:%M"),
                         )
                     wait = max(0, delay - (clock.perf_counter() - started_perf))
                     if wait:
@@ -1329,6 +1486,9 @@ async def main(args: argparse.Namespace | None = None) -> None:
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     options = parse_args()
     if options.report or options.status:
         configuration = load_settings(validate_booking=False)
@@ -1346,4 +1506,4 @@ if __name__ == "__main__":
         try:
             asyncio.run(main(options))
         except KeyboardInterrupt:
-            print("Monitor stopped by user.")
+            print("İzleme kullanıcı tarafından durduruldu.")

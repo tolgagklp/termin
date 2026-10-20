@@ -52,8 +52,9 @@ general-purpose Telegram bot still uses its separate API-based checker.
    `.\.venv\Scripts\python.exe -m src.driver_license_monitor --telegram-chat-id`
    to find your chat ID. Put it in `TELEGRAM_CHAT_ID`, then verify delivery with
    `.\.venv\Scripts\python.exe -m src.driver_license_monitor --test-telegram`.
-2. In Python 3.11+, install `playwright`, `python-dotenv`, and
-   `python-telegram-bot`, then run `python -m playwright install chromium` once.
+2. In Python 3.11+, install `playwright` and `python-dotenv`, then run
+   `python -m playwright install chromium` once. The dedicated monitor sends
+   notifications through Telegram's HTTPS API without another package.
 3. On Windows, run a one-time read-only check with
    `.\.venv\Scripts\python.exe -m src.driver_license_monitor --once`.
 4. Run continuous monitor-only mode with
@@ -68,8 +69,14 @@ page in the same tab, chooses the service, presses Weiter, and reads the dates a
 times from the page DOM; it does not take or analyze screenshots. If no matching
 slot is visible, it waits and repeats. In monitor-only mode it continues after a
 match and sends Telegram alerts for newly seen or reappearing matching times.
-The first scan also sends one alert if a matching slot is already visible.
-Continuous visibility in later scans does not create repeated alerts. `MONITOR_SCHEDULE`
+The first scan sends one message listing matching slots that have not previously
+been alerted, plus any that disappeared in a prior scan and have returned.
+Each later scan sends at most one message listing all newly seen or reappearing
+matching slots. A slot is alerted again only after `ALERT_COOLDOWN_MINUTES`
+(default 30) have passed since its last alert; this survives restarts.
+Continuous visibility in later scans does not create repeated alerts. The same
+readable Turkish alert appears in the terminal and on Telegram when configured.
+`MONITOR_SCHEDULE`
 defines weekday and weekend intervals in Berlin local time; the minimum gap between
 check starts is 120 seconds. The scheduler recalculates after each scan and handles
 the October clock change. If a scan lasts longer than the scheduled interval, the
@@ -85,7 +92,8 @@ Past dates are excluded. Add `#latest` to a range to choose its latest time;
 `#earliest` is optional. Update the initial 2026 dates as needed.
 
 The ignored `monitor/` directory contains `slot_events.json` (each distinct
-date/time's first and last sighting, reappearance count, current visibility and
+date/time's first and last sighting, reappearance and alert counts, last alert,
+current visibility and
 preference match), `metrics.jsonl` (one record per scan with stage durations,
 total duration and the schedule), `monitor.log` (readable terminal messages),
 and `booking.state.json` (reservation status). The log rotates at 5 MB and keeps
