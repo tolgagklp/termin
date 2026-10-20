@@ -48,6 +48,7 @@ env/
 
 # Logs
 *.log
+/monitor/
 monitor_metrics.jsonl
 slot_events.json
 slot_events.json.tmp

@@ -8,10 +8,13 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.driver_license_monitor import (
+    Settings,
     _write_state,
     acquire_instance_lock,
+    append_metrics,
     booking_is_pending,
     choose_slot,
+    monitor_status,
     next_check_delay,
     parse_schedule,
     parse_slots,
@@ -144,8 +147,12 @@ def test_slot_events_keep_first_seen_and_track_visibility(tmp_path):
     b = (date(2026, 11, 3), time(14, 40))
     first = datetime(2026, 10, 20, 14, tzinfo=ZoneInfo("Europe/Berlin"))
     later = datetime(2026, 10, 20, 14, 2, tzinfo=ZoneInfo("Europe/Berlin"))
-    assert record_slot_events(path, [a, b], windows, first) == [b, a]
-    assert record_slot_events(path, [a], windows, later) == []
+    changes = record_slot_events(path, [a, b], windows, first)
+    assert changes.first_seen == (b, a)
+    assert changes.reappeared == ()
+    changes = record_slot_events(path, [a], windows, later)
+    assert changes.first_seen == ()
+    assert changes.reappeared == ()
     import json
 
     events = json.loads(path.read_text(encoding="utf-8"))
@@ -153,9 +160,12 @@ def test_slot_events_keep_first_seen_and_track_visibility(tmp_path):
     assert events["2026-11-03 16:20"]["last_seen"] == later.isoformat()
     assert events["2026-11-03 16:20"]["matches_preferences"] is True
     assert events["2026-11-03 14:40"]["visible_now"] is False
-    assert record_slot_events(path, [a, b], windows, later) == []
+    changes = record_slot_events(path, [a, b], windows, later)
+    assert changes.first_seen == ()
+    assert changes.reappeared == (b,)
     events = json.loads(path.read_text(encoding="utf-8"))
     assert events["2026-11-03 14:40"]["first_seen"] == first.isoformat()
+    assert events["2026-11-03 14:40"]["appearance_count"] == 2
 
 
 def test_booking_guard_and_instance_lock_prevent_duplicate_attempts(tmp_path):
@@ -174,3 +184,44 @@ def test_booking_guard_and_instance_lock_prevent_duplicate_attempts(tmp_path):
             acquire_instance_lock(state)
     finally:
         lock.unlink()
+
+
+def test_local_status_reports_booking_and_last_scan_without_contact_data(tmp_path):
+    settings = Settings(
+        windows=parse_windows("2026-11-02..2026-11-20@16:00-23:59#latest"),
+        schedule=parse_schedule("weekday@00:00-24:00=120;weekend@00:00-24:00=600"),
+        auto_book=True,
+        first_name="Private",
+        last_name="Person",
+        email="private@example.com",
+        date_of_birth="01.01.1990",
+        telegram_token="secret-token",
+        telegram_chat_id="123",
+        state_file=tmp_path / "booking.state.json",
+        events_file=tmp_path / "slots.json",
+        metrics_file=tmp_path / "metrics.jsonl",
+        log_file=tmp_path / "monitor.log",
+    )
+    _write_state(
+        settings.state_file,
+        {
+            "booking_submitted": True,
+            "slot": "03.11.2026 16:40",
+            "submitted_at": "2026-10-20T16:00:00+02:00",
+            "activation_deadline_at": "2026-10-20T17:00:00+02:00",
+        },
+    )
+    append_metrics(
+        settings.metrics_file,
+        {
+            "started_at": "2026-10-20T15:59:00+02:00",
+            "visible_slots": 2,
+            "outcome": "booking_attempted",
+        },
+    )
+    status = monitor_status(settings)
+    assert "03.11.2026 16:40" in status
+    assert "Last scan: 2026-10-20T15:59:00+02:00; 2 visible" in status
+    assert "email activation" in status
+    assert "private@example.com" not in status
+    assert "secret-token" not in status

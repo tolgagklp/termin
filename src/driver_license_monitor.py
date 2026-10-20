@@ -13,9 +13,10 @@ import re
 import time as clock
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from itertools import pairwise
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -120,6 +121,7 @@ class Settings:
     state_file: Path
     events_file: Path
     metrics_file: Path
+    log_file: Path
 
 
 @dataclass(frozen=True)
@@ -134,7 +136,14 @@ class ScheduleWindow:
 class ScanResult:
     selected: AppointmentSlot | None
     arrivals: tuple[tuple[date, time], ...]
+    reappeared: tuple[tuple[date, time], ...]
     visible_count: int
+
+
+@dataclass(frozen=True)
+class SlotChanges:
+    first_seen: tuple[tuple[date, time], ...]
+    reappeared: tuple[tuple[date, time], ...]
 
 
 def parse_windows(value: str) -> tuple[PreferenceWindow, ...]:
@@ -331,11 +340,26 @@ def load_settings(*, validate_booking: bool = True) -> Settings:
         date_of_birth=fields["DATE_OF_BIRTH"],
         telegram_token=token,
         telegram_chat_id=chat_id,
-        state_file=Path(
-            os.getenv("MONITOR_STATE_FILE", ".driver_license_monitor.state.json")
-        ),
-        events_file=Path(os.getenv("SLOT_EVENTS_FILE", "slot_events.json")),
-        metrics_file=Path(os.getenv("MONITOR_METRICS_FILE", "monitor_metrics.jsonl")),
+        state_file=Path(os.getenv("MONITOR_STATE_FILE", "monitor/booking.state.json")),
+        events_file=Path(os.getenv("SLOT_EVENTS_FILE", "monitor/slot_events.json")),
+        metrics_file=Path(os.getenv("MONITOR_METRICS_FILE", "monitor/metrics.jsonl")),
+        log_file=Path(os.getenv("MONITOR_LOG_FILE", "monitor/monitor.log")),
+    )
+
+
+def configure_logging(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
+    terminal_handler = logging.StreamHandler()
+    for handler in (terminal_handler, file_handler):
+        handler.addFilter(lambda record: record.name == logger.name)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[terminal_handler, file_handler],
+        force=True,
     )
 
 
@@ -649,8 +673,8 @@ def record_slot_events(
     slots: Iterable[tuple[date, time]],
     windows: tuple[PreferenceWindow, ...],
     observed_at: datetime,
-) -> list[tuple[date, time]]:
-    """Persist first/last sightings without counting repeated scans as arrivals."""
+) -> SlotChanges:
+    """Persist first/last sightings and distinguish return from continuous visibility."""
     try:
         events = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(events, dict):
@@ -658,9 +682,13 @@ def record_slot_events(
     except FileNotFoundError:
         events = {}
     current = set(slots)
+    previously_visible = {
+        key: bool(value.get("visible_now")) for key, value in events.items()
+    }
     for value in events.values():
         value["visible_now"] = False
     arrivals = []
+    reappeared = []
     for slot_date, slot_time in sorted(current):
         key = f"{slot_date:%Y-%m-%d} {slot_time:%H:%M}"
         matching = slot_date >= observed_at.date() and any(
@@ -671,8 +699,15 @@ def record_slot_events(
                 "first_seen": observed_at.isoformat(),
                 "appointment_date": slot_date.isoformat(),
                 "appointment_time": slot_time.strftime("%H:%M"),
+                "appearance_count": 1,
             }
             arrivals.append((slot_date, slot_time))
+        elif not previously_visible[key]:
+            events[key]["appearance_count"] = (
+                int(events[key].get("appearance_count", 1)) + 1
+            )
+            events[key]["last_reappeared"] = observed_at.isoformat()
+            reappeared.append((slot_date, slot_time))
         events[key].update(
             {
                 "last_seen": observed_at.isoformat(),
@@ -681,7 +716,7 @@ def record_slot_events(
             }
         )
     _write_state(path, events)
-    return arrivals
+    return SlotChanges(tuple(arrivals), tuple(reappeared))
 
 
 def append_metrics(path: Path, record: dict) -> None:
@@ -753,6 +788,7 @@ def observation_report(events_file: Path, metrics_file: Path) -> str:
     )
     lines = [
         f"Scan attempts/completed: {len(scans)}/{len(complete)}; distinct appointment times first seen: {len(events)}",
+        f"Recorded reappearances: {sum(max(0, int(value.get('appearance_count', 1)) - 1) for value in events.values())}",
         f"Observation span: {span:.1f} hours",
         f"First seen 07:00-08:30: {morning}; 13:40-14:45: {afternoon}; other times: {len(first_seen) - morning - afternoon}",
         "First sightings by Berlin hour: "
@@ -784,6 +820,48 @@ def observation_report(events_file: Path, metrics_file: Path) -> str:
         lines.append(
             "Fewer than 24 hours of scans; release-time conclusions are premature."
         )
+    return "\n".join(lines)
+
+
+def monitor_status(settings: Settings) -> str:
+    state = _read_state(settings.state_file)
+    if state.get("booking_submitted"):
+        booking = "Reservation request submitted; email activation is checked manually."
+    elif state.get("booking_pending"):
+        booking = "Reservation outcome pending or unclear; review email/site before restarting auto booking."
+    else:
+        booking = "No reservation request recorded by this monitor."
+    lines = [
+        f"Automatic booking: {'enabled' if settings.auto_book else 'disabled'}",
+        booking,
+    ]
+    if state.get("slot"):
+        lines.append(f"Recorded appointment: {state['slot']}")
+    if state.get("pending_started_at"):
+        lines.append(f"Reservation attempt started at: {state['pending_started_at']}")
+    if state.get("submitted_at"):
+        lines.append(f"Request submitted at: {state['submitted_at']}")
+    if state.get("activation_deadline_at"):
+        deadline = datetime.fromisoformat(state["activation_deadline_at"])
+        seconds_left = (deadline.astimezone(UTC) - datetime.now(UTC)).total_seconds()
+        time_left = (
+            f"about {int((seconds_left + 59) // 60)} minutes remaining"
+            if seconds_left > 0
+            else "estimated deadline passed"
+        )
+        lines.append(
+            f"Estimated email activation deadline: {deadline.isoformat()} ({time_left})"
+        )
+    try:
+        last = settings.metrics_file.read_text(encoding="utf-8").splitlines()[-1]
+        scan = json.loads(last)
+        lines.append(
+            f"Last scan: {scan.get('started_at', 'unknown')}; "
+            f"{scan.get('visible_slots', '?')} visible; "
+            f"outcome {scan.get('outcome', 'unknown')}"
+        )
+    except (FileNotFoundError, IndexError, json.JSONDecodeError):
+        lines.append("Last scan: none recorded")
     return "\n".join(lines)
 
 
@@ -842,7 +920,14 @@ async def submit_booking(
             "heading", name=re.compile("Übersicht", re.IGNORECASE)
         ).wait_for(timeout=30_000)
 
-    _write_state(settings.state_file, {"booking_pending": True, "slot": slot.label})
+    _write_state(
+        settings.state_file,
+        {
+            "booking_pending": True,
+            "slot": slot.label,
+            "pending_started_at": datetime.now(BERLIN).isoformat(),
+        },
+    )
     final_button_names = (
         "Termin reservieren",
         "Termin verbindlich buchen",
@@ -874,18 +959,30 @@ async def submit_booking(
                     re.IGNORECASE,
                 )
             ).wait_for(timeout=20_000)
-    except Exception:
-        logger.exception(
-            "Final booking action was clicked but confirmation was unclear"
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Final booking action was clicked but confirmation was unclear (%s)",
+            type(exc).__name__,
         )
         return (
             f"The final booking action was clicked for {slot.label}, but the site did not show "
             f"a clear confirmation. Check {settings.email} and the browser result; the monitor "
             "will not retry automatically."
         )
+    submitted_at = datetime.now(BERLIN)
     _write_state(
         settings.state_file,
-        {"booking_pending": False, "booking_submitted": True, "slot": slot.label},
+        {
+            "booking_pending": False,
+            "booking_submitted": True,
+            "slot": slot.label,
+            "submitted_at": submitted_at.isoformat(),
+            "activation_deadline_at": (
+                submitted_at.astimezone(UTC) + timedelta(minutes=60)
+            )
+            .astimezone(BERLIN)
+            .isoformat(),
+        },
     )
     return (
         f"Appointment request submitted for {slot.label}. Check {settings.email} and "
@@ -908,18 +1005,19 @@ async def check_page(
         ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in slots) or "none",
     )
     observed_at = datetime.now(BERLIN)
-    arrivals = record_slot_events(
+    changes = record_slot_events(
         settings.events_file, slots, settings.windows, observed_at
     )
     logger.info(
-        "Newly observed slots: %s",
-        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in arrivals) or "none",
+        "First seen slots: %s; reappeared slots: %s",
+        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in changes.first_seen) or "none",
+        ", ".join(f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in changes.reappeared) or "none",
     )
     with timed(metrics, "preference_algorithm"):
         selected = choose_slot(slots, settings.windows, today=observed_at.date())
     if selected is None:
         logger.info("No slot matches the configured date and time preferences.")
-        return ScanResult(None, tuple(arrivals), len(slots))
+        return ScanResult(None, changes.first_seen, changes.reappeared, len(slots))
 
     window = settings.windows[selected.preference_rank]
     logger.info(
@@ -933,7 +1031,7 @@ async def check_page(
         window.order,
     )
     if not auto_book:
-        return ScanResult(selected, tuple(arrivals), len(slots))
+        return ScanResult(selected, changes.first_seen, changes.reappeared, len(slots))
 
     if booking_is_pending(settings.state_file):
         raise RuntimeError(
@@ -941,7 +1039,7 @@ async def check_page(
         )
     message = await submit_booking(page, settings, selected, metrics)
     await notify(settings, message, metrics)
-    return ScanResult(selected, tuple(arrivals), len(slots))
+    return ScanResult(selected, changes.first_seen, changes.reappeared, len(slots))
 
 
 async def run_once(
@@ -961,12 +1059,14 @@ async def run_once(
             outcome = "error"
             visible_count = 0
             arrival_count = 0
+            reappeared_count = 0
             try:
                 result = await check_page(
                     page, settings, auto_book=auto_book, metrics=metrics
                 )
                 visible_count = result.visible_count
                 arrival_count = len(result.arrivals)
+                reappeared_count = len(result.reappeared)
                 outcome = "completed"
                 return result.selected
             finally:
@@ -979,6 +1079,7 @@ async def run_once(
                         "outcome": outcome,
                         "visible_slots": visible_count,
                         "new_slots": arrival_count,
+                        "reappeared_slots": reappeared_count,
                         "total_seconds": duration,
                         "stages": metrics,
                     },
@@ -1006,16 +1107,63 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Send a test alert to the configured Telegram chat.",
     )
+    mode.add_argument(
+        "--status", action="store_true", help="Show local reservation and scan status."
+    )
+    mode.add_argument(
+        "--telegram-chat-id",
+        action="store_true",
+        help="Read chat IDs from recent messages to the configured bot.",
+    )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Monitor continuously with terminal/file alerts only; never submit a reservation.",
+    )
     return parser.parse_args()
 
 
 async def main(args: argparse.Namespace | None = None) -> None:
     args = args or parse_args()
     settings = load_settings(
-        validate_booking=not (args.once or args.report or args.test_telegram)
+        validate_booking=not (
+            args.once
+            or args.report
+            or args.test_telegram
+            or args.status
+            or args.telegram_chat_id
+            or args.local_only
+        )
     )
     if args.report:
         print(observation_report(settings.events_file, settings.metrics_file))
+        return
+    if args.status:
+        print(monitor_status(settings))
+        return
+    if args.telegram_chat_id:
+        if not settings.telegram_token:
+            raise SystemExit("Set TELEGRAM_BOT_TOKEN before reading chat IDs.")
+        from telegram import Bot
+
+        try:
+            async with Bot(settings.telegram_token) as bot:
+                updates = await bot.get_updates(limit=20, timeout=0)
+        except Exception as exc:  # noqa: BLE001
+            raise SystemExit(
+                f"Could not read bot messages ({type(exc).__name__}); check the token and bot setup."
+            ) from None
+        chat_ids = sorted(
+            {
+                update.effective_chat.id
+                for update in updates
+                if update.effective_chat is not None
+            }
+        )
+        print(
+            "Chat IDs from recent bot messages: "
+            + (", ".join(map(str, chat_ids)) or "none; send /start to your bot first")
+        )
         return
     if args.test_telegram:
         if not settings.telegram_token or not settings.telegram_chat_id:
@@ -1031,7 +1179,14 @@ async def main(args: argparse.Namespace | None = None) -> None:
         await run_once(settings, auto_book=False)
         return
 
-    if not settings.telegram_token or not settings.telegram_chat_id:
+    if args.local_only:
+        if settings.auto_book:
+            raise SystemExit("Disable AUTO_BOOK_ENABLED before using --local-only.")
+        settings = replace(settings, telegram_token="", telegram_chat_id="")
+        logger.warning(
+            "Local-only monitoring: matching slots appear in terminal and monitor.log; Telegram alerts are disabled."
+        )
+    elif not settings.telegram_token or not settings.telegram_chat_id:
         raise SystemExit(
             "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID before monitoring."
         )
@@ -1062,6 +1217,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
                     outcome = "no_match"
                     visible_count = 0
                     arrival_count = 0
+                    reappeared_count = 0
                     try:
                         if settings.auto_book and booking_is_pending(
                             settings.state_file
@@ -1080,13 +1236,14 @@ async def main(args: argparse.Namespace | None = None) -> None:
                         )
                         visible_count = result.visible_count
                         arrival_count = len(result.arrivals)
+                        reappeared_count = len(result.reappeared)
                         if result.selected is not None and settings.auto_book:
                             outcome = "booking_attempted"
                             return
                         if not settings.auto_book:
                             arrivals = [
                                 slot
-                                for slot in result.arrivals
+                                for slot in (*result.arrivals, *result.reappeared)
                                 if slot[0] >= started_at.date()
                                 and any(
                                     window.contains(*slot)
@@ -1094,20 +1251,22 @@ async def main(args: argparse.Namespace | None = None) -> None:
                                 )
                             ]
                             if first_scan and result.selected:
-                                await notify(
-                                    settings,
-                                    f"Matching appointment found: {result.selected.label}",
-                                    metrics,
-                                )
+                                message = f"Matching appointment found: {result.selected.label}"
+                                if args.local_only:
+                                    logger.warning("LOCAL ALERT: %s", message)
+                                else:
+                                    await notify(settings, message, metrics)
                             elif arrivals:
                                 labels = ", ".join(
                                     f"{d:%d.%m.%Y} {t:%H:%M}" for d, t in arrivals
                                 )
-                                await notify(
-                                    settings,
-                                    f"New matching appointments: {labels}",
-                                    metrics,
+                                message = (
+                                    f"Newly visible matching appointments: {labels}"
                                 )
+                                if args.local_only:
+                                    logger.warning("LOCAL ALERT: %s", message)
+                                else:
+                                    await notify(settings, message, metrics)
                             first_scan = False
                         outcome = "match_visible" if result.selected else "no_match"
                     except Exception as exc:  # noqa: BLE001
@@ -1138,6 +1297,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
                                 "total_seconds": elapsed,
                                 "visible_slots": visible_count,
                                 "new_slots": arrival_count,
+                                "reappeared_slots": reappeared_count,
                                 "actual_start_gap_seconds": actual_start_gap,
                                 "target_interval_seconds": interval,
                                 "next_start_after_seconds": delay,
@@ -1158,18 +1318,32 @@ async def main(args: argparse.Namespace | None = None) -> None:
                     if wait:
                         await asyncio.sleep(wait)
             finally:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception:
+                    task = asyncio.current_task()
+                    if task is None or not task.cancelling():
+                        raise
     finally:
         lock_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-    )
     options = parse_args()
-    if options.report:
+    if options.report or options.status:
         configuration = load_settings(validate_booking=False)
-        print(observation_report(configuration.events_file, configuration.metrics_file))
+        if options.report:
+            print(
+                observation_report(
+                    configuration.events_file, configuration.metrics_file
+                )
+            )
+        else:
+            print(monitor_status(configuration))
     else:
-        asyncio.run(main(options))
+        configuration = load_settings(validate_booking=False)
+        configure_logging(configuration.log_file)
+        try:
+            asyncio.run(main(options))
+        except KeyboardInterrupt:
+            print("Monitor stopped by user.")
