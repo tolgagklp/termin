@@ -52,7 +52,7 @@ KVR'nin [hizmet sayfası](https://stadt.muenchen.de/service/info/servicestelle-f
 | İşe başlama ve Blue Card | Yalnızca işe başlamak acil durum sayılmıyor. Notfall gişesi Blue Card verme/uzatma işlemini yapmıyor. [Blue Card başvurusu](https://stadt.muenchen.de/service/en-GB/info/servicestelle-fur-zuwanderung-und-einburgerung/10422541/) ayrı olarak çevrim içi veya postayla yapılır; incelemeden sonra KVR görüşme randevusu verir. [Genel Notfall açıklaması](https://stadt.muenchen.de/service/info/servicestelle-fur-zuwanderung-und-einburgerung/10339065/). |
 | Benim gözlemim | **20 Ekim 2026:** İnsan doğrulamasını elle tamamlayınca tarih ekranı açıldı; **boş randevu yoktu**. Sayfa yenilenince doğrulama yeniden istendi. |
 | Telegram ne yapıyor? | **Aynı bot**, resmî açılıştan **10 dakika önce, 2 dakika önce ve açılışta** bağlantılı hatırlatma gönderiyor. **Boş saatleri kontrol etmiyor, rezervasyon yapmıyor.** Gönderim kaydı tekrar mesajı önlüyor. |
-| Boş randevu bulamazsam | KVR servis telefonu: **+49 89 233-96010**. [Kaynak](https://stadt.muenchen.de/service/info/servicestelle-fur-zuwanderung-und-einburgerung/10338844/). |
+| Telefonla ulaşma | **+49 89 233-96010** · Pazartesi–Perşembe **07:30–15:30**, cuma **07:30–13:00**, hafta sonu kapalı. Telefon hattının açılışı online randevu saatinden ayrıdır; **21 Ekim Çarşamba** online Notfall saatleri 06:30'da, telefon hattı 07:30'da açılır. [KVR hizmet sayfası](https://stadt.muenchen.de/service/info/servicestelle-fur-zuwanderung-und-einburgerung/10338844/). |
 
 | Yerel komutlar — proje klasöründe PowerShell | Komut |
 | --- | --- |
